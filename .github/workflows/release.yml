@@ -1,0 +1,72 @@
+name: Publish to Thunderstore
+
+# Publishes the zip attached to a GitHub Release to Thunderstore.
+#
+# Flow:
+#   1. Locally: bump version_number in manifest.json + add a CHANGELOG entry.
+#   2. Locally: `pwsh tools/package.ps1` -> artifacts/Cray-<Name>-<Version>.zip
+#   3. Commit + tag + push, e.g. `git tag v0.2.0 && git push --tags`.
+#   4. Create a GitHub Release with the zip attached:
+#        gh release create v0.2.0 artifacts/Cray-<Name>-<Version>.zip --notes-file CHANGELOG.md
+#   5. This workflow runs on release:published, downloads the asset, and
+#      uploads it to Thunderstore under the team `Cray` in the
+#      `super-battle-golf` community using secrets.THUNDERSTORE_TOKEN.
+#
+# Required repo secret:
+#   THUNDERSTORE_TOKEN  Service-account token from https://thunderstore.io/settings/teams/
+#
+# Why not build in CI: the project references Super Battle Golf's shipped Unity
+# assemblies, which aren't publicly redistributable. Builds happen locally.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to re-publish (e.g. v0.2.0)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - name: Resolve release zip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "$TAG" --repo "${{ github.repository }}" --pattern "Cray-*.zip" --dir .
+          ZIP=$(ls Cray-*.zip | head -n1)
+          test -n "$ZIP" && test -f "$ZIP" || { echo "No Cray-*.zip asset found on release $TAG"; exit 1; }
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+
+      - name: Extract manifest.json from zip
+        id: manifest
+        run: |
+          unzip -p "$ZIP" manifest.json > manifest.json
+          {
+            echo "name=$(jq -r .name         manifest.json)"
+            echo "version=$(jq -r .version_number manifest.json)"
+            echo "description=$(jq -r .description  manifest.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload to Thunderstore
+        uses: GreenTF/upload-thunderstore-package@v4.3
+        with:
+          namespace:   Cray
+          community:   super-battle-golf
+          name:        ${{ steps.manifest.outputs.name }}
+          version:     ${{ steps.manifest.outputs.version }}
+          description: ${{ steps.manifest.outputs.description }}
+          website:     https://github.com/${{ github.repository }}
+          file:        ${{ env.ZIP }}
+          token:       ${{ secrets.THUNDERSTORE_TOKEN }}
+          # Workaround: the action's entrypoint.sh has inverted `--repository` logic —
+          # leaving this unset resolves to empty and tcli fails silently with 'Publish to '
+          # (no target). Any non-empty value trips the branch that hardcodes to thunderstore.io.
+          repo:        thunderstore.io

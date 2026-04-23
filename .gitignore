@@ -1,0 +1,32 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+*.pidb
+*.userprefs
+.vs/
+
+# IDE
+.idea/
+.vscode/
+
+# Build / packaging output
+artifacts/
+dist/
+*.zip
+
+# Developer-local overrides
+Developer.props
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Misc
+*.log
+
+# Dev-time screenshots (keep locally but don't push)
+# icon.png is the official Thunderstore package icon and must be tracked.
+*.png
+!icon.png
