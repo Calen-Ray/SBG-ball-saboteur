@@ -41,6 +41,8 @@
     <Reference Include="UnityEngine.InputLegacyModule"><HintPath>$(GameManagedDir)\UnityEngine.InputLegacyModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.PhysicsModule"><HintPath>$(GameManagedDir)\UnityEngine.PhysicsModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Unity.InputSystem"><HintPath>$(GameManagedDir)\Unity.InputSystem.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Unity.Localization"><HintPath>$(GameManagedDir)\Unity.Localization.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.UIElementsModule"><HintPath>$(GameManagedDir)\UnityEngine.UIElementsModule.dll</HintPath><Private>false</Private></Reference>
   </ItemGroup>
 
   <Target Name="DeployToR2Modman" AfterTargets="Build" Condition="'$(SkipDeploy)' != 'true' and Exists('$(BepInExPluginsDir)')">

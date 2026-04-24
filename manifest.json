@@ -1,6 +1,6 @@
 {
     "name": "BallSaboteur",
-    "version_number": "0.1.1",
+    "version_number": "0.1.2",
     "website_url": "https://github.com/Calen-Ray/SBG-ball-saboteur",
     "description": "Adds a new lock-on sabotage item that turns a target player's ball into a cube until they complete a qualifying stroke.",
     "dependencies": [
