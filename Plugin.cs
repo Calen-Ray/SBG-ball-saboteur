@@ -40,12 +40,16 @@ namespace BallSaboteur
         private static FieldInfo itemDataPrefabField;
         private static FieldInfo itemDataMaxUsesField;
         private static FieldInfo itemDataCanUsageAffectBallsField;
+        private static FieldInfo itemDataNameField;
+        private static FieldInfo networkIdentityAssetIdField;
+        private static uint customPickupAssetId;
         private static FieldInfo ballRenderersField;
         private static FieldInfo itemPoolSpawnChancesField;
         private static Type itemSpawnChanceType;
         private static FieldInfo itemSpawnChanceItemField;
         private static FieldInfo itemSpawnChanceWeightField;
         private static readonly HashSet<ItemPool> injectedPools = new HashSet<ItemPool>();
+        private static readonly Dictionary<ItemPool, float> trackedPoolSpawnPercents = new Dictionary<ItemPool, float>();
 
         private static MethodInfo objectMemberwiseCloneMethod;
         private static MethodInfo updateOrbitalLaserLockOnTargetMethod;
@@ -158,6 +162,8 @@ namespace BallSaboteur
             itemDataPrefabField = AccessTools.Field(typeof(ItemData), "<Prefab>k__BackingField");
             itemDataMaxUsesField = AccessTools.Field(typeof(ItemData), "<MaxUses>k__BackingField");
             itemDataCanUsageAffectBallsField = AccessTools.Field(typeof(ItemData), "<CanUsageAffectBalls>k__BackingField");
+            itemDataNameField = AccessTools.Field(typeof(ItemData), "name");
+            networkIdentityAssetIdField = AccessTools.Field(typeof(NetworkIdentity), "_assetId");
             ballRenderersField = AccessTools.Field(typeof(GolfBall), "renderers");
             itemPoolSpawnChancesField = AccessTools.Field(typeof(ItemPool), "spawnChances");
             itemSpawnChanceType = typeof(ItemPool).GetNestedType("ItemSpawnChance");
@@ -204,6 +210,9 @@ namespace BallSaboteur
             }
 
             NetworkClient.ReplaceHandler<BallSabotageStateMessage>(OnBallSabotageStateMessage, false);
+            // NetworkClient.ClearSpawners nukes the prefabs dict on Shutdown, so the pickup prefab
+            // registration has to rejoin the re-register sweep.
+            TryRegisterCustomPickupPrefab();
         }
 
         private static void WriteBallSabotageState(NetworkWriter writer, BallSabotageStateMessage message)
@@ -380,21 +389,76 @@ namespace BallSaboteur
         private static void EnsureCustomPickupPrefab(ItemData orbitalLaserData)
         {
             if (customPickupPrefab != null)
+            {
+                TryRegisterCustomPickupPrefab();
                 return;
+            }
 
             GameObject sourcePrefab = itemDataPrefabField?.GetValue(orbitalLaserData) as GameObject;
             if (sourcePrefab == null)
                 return;
 
-            customPickupPrefab = Instantiate(sourcePrefab);
+            // An inactive parent keeps the template dormant without setting the template's own
+            // activeSelf to false. CourseManager.ServerSpawnItem does Instantiate(prefab, pos, rot)
+            // at world root, so the clone keeps activeSelf=true and Awake runs immediately —
+            // without this, PhysicalItem.AsEntity stays null and the drop code NREs reading
+            // `component.AsEntity.Rigidbody.linearVelocity`, the slot clears, and nothing spawns.
+            GameObject root = new GameObject("BallSaboteurPrefabRoot");
+            root.hideFlags = HideFlags.HideAndDontSave;
+            root.SetActive(false);
+            DontDestroyOnLoad(root);
+
+            customPickupPrefab = Instantiate(sourcePrefab, root.transform);
             customPickupPrefab.name = "BallSaboteurPickupRuntime";
-            customPickupPrefab.hideFlags = HideFlags.HideAndDontSave;
-            customPickupPrefab.SetActive(false);
-            DontDestroyOnLoad(customPickupPrefab);
 
             PhysicalItem physicalItem = customPickupPrefab.GetComponent<PhysicalItem>();
             if (physicalItem != null && physicalItemTypeField != null)
                 physicalItemTypeField.SetValue(physicalItem, CustomItemType);
+
+            // Our clone carries Orbital Laser's NetworkIdentity.assetId. That conflicts with the
+            // real OL prefab, and on drop NetworkServer.Spawn broadcasts a SpawnMessage that
+            // remote clients resolve against the game's prefab registry — they either find OL
+            // (and render the wrong item) or fail to resolve, flooding errors and crashing on
+            // further sync updates. Reassign a deterministic assetId derived from the mod guid
+            // and register under NetworkClient.prefabs so every participant that has the mod
+            // resolves the same runtime prefab.
+            NetworkIdentity identity = customPickupPrefab.GetComponent<NetworkIdentity>();
+            if (identity != null && networkIdentityAssetIdField != null)
+            {
+                customPickupAssetId = ComputeCustomPickupAssetId();
+                networkIdentityAssetIdField.SetValue(identity, 0u);
+                TryRegisterCustomPickupPrefab();
+            }
+        }
+
+        private static uint ComputeCustomPickupAssetId()
+        {
+            // FNV-1a over a stable key so every client computes the same id for the same mod
+            // version. Changing CustomItemTypeRaw invalidates the id, which matches the CLAUDE.md
+            // guidance to bump the mod major version in that case.
+            string key = ModGuid + ":pickup:" + CustomItemTypeRaw;
+            uint h = 2166136261u;
+            for (int i = 0; i < key.Length; i++)
+                h = (h ^ key[i]) * 16777619u;
+            return h == 0u ? 1u : h;
+        }
+
+        private static void TryRegisterCustomPickupPrefab()
+        {
+            if (customPickupPrefab == null || customPickupAssetId == 0u)
+                return;
+            // NetworkClient.ClearSpawners wipes this dict on Shutdown, so re-register is idempotent
+            // and needed after every reconnect.
+            if (NetworkClient.prefabs.TryGetValue(customPickupAssetId, out GameObject existing) && existing == customPickupPrefab)
+                return;
+            try
+            {
+                NetworkClient.RegisterPrefab(customPickupPrefab, customPickupAssetId);
+            }
+            catch (Exception ex)
+            {
+                Log?.LogWarning($"Ball Saboteur prefab registration failed: {ex.Message}");
+            }
         }
 
         private static ItemData CloneItemData(ItemData source, GameObject prefab)
@@ -404,6 +468,11 @@ namespace BallSaboteur
             itemDataPrefabField?.SetValue(clone, prefab);
             itemDataMaxUsesField?.SetValue(clone, 1);
             itemDataCanUsageAffectBallsField?.SetValue(clone, true);
+            // MemberwiseClone copies the private `name` field verbatim; if the Orbital Laser
+            // already lazy-resolved its LocalizedName we'd inherit OL's "ITEM_OrbitalLaser"
+            // reference and show "Global Strike" everywhere. Clear it so the getter re-resolves
+            // with our Type -> "ITEM_1001" -> our LocalizedString postfix rewrites it.
+            itemDataNameField?.SetValue(clone, null);
             return clone;
         }
 
@@ -701,6 +770,10 @@ namespace BallSaboteur
             private static void Postfix(ItemCollection __instance) => EnsureCustomItemRegistered(__instance);
         }
 
+        // Expose the saboteur to PauseMenu's item-probability grid, which iterates
+        // AllItems.Count and calls GetItemAtIndex(i). We don't mutate the underlying
+        // items array (that's what broke match-setup in 0.1.2); we just appear at the
+        // synthetic tail index.
         [HarmonyPatch(typeof(ItemCollection), "get_Count")]
         private static class Patch_ItemCollection_Count
         {
@@ -720,16 +793,27 @@ namespace BallSaboteur
                     return true;
 
                 ItemData[] items = itemCollectionItemsField.GetValue(__instance) as ItemData[];
-                if (items == null)
+                if (items == null || index != items.Length)
                     return true;
 
-                if (index == items.Length)
-                {
-                    __result = customItemData;
-                    return false;
-                }
+                __result = customItemData;
+                return false;
+            }
+        }
 
-                return true;
+        // The hand-equipment mapping in PlayerInventory.UpdateEquipmentSwitchers is a
+        // switch on GetEffectivelyEquippedItem(); our runtime ItemType falls into the
+        // default (EquipmentType.None) case so nothing renders in hand. Remap the
+        // result to OrbitalLaser — the item is a clone of the laser and we want the
+        // same visual, aim reticle, and lock-on validation. The use-path checks
+        // GetEffectiveSlot directly (not this accessor), so custom sabotage still fires.
+        [HarmonyPatch(typeof(PlayerInventory), nameof(PlayerInventory.GetEffectivelyEquippedItem))]
+        private static class Patch_PlayerInventory_GetEffectivelyEquippedItem
+        {
+            private static void Postfix(ref ItemType __result)
+            {
+                if (__result == CustomItemType)
+                    __result = OrbitalLaserItemType;
             }
         }
 
@@ -787,6 +871,14 @@ namespace BallSaboteur
         }
 
         private static bool localizationEntryRegistered;
+
+        private static void TrackPoolSpawnPercent(ItemPool pool, float targetPercent)
+        {
+            if (pool == null)
+                return;
+
+            trackedPoolSpawnPercents[pool] = Mathf.Clamp(targetPercent, 0f, 100f);
+        }
 
         internal static void TryRegisterCustomLocalizationEntry()
         {
@@ -870,52 +962,21 @@ namespace BallSaboteur
             {
                 try
                 {
-                    if (__result == CustomItemLocalizationFallback)
+                    // Lazy: touching LocalizationSettings during ItemCollection.OnEnable deadlocks
+                    // the main thread against async localization init. Once GetLocalizedString is
+                    // firing, Localization is ready, so it's safe to register our entry now.
+                    TryRegisterCustomLocalizationEntry();
+
+                    if (string.IsNullOrEmpty(__result))
+                        return;
+                    // Unity's missing-entry fallback varies: can be "Data/ITEM_1001",
+                    // "ITEM_1001", or a "No translation for '...'" placeholder. Match any
+                    // form that mentions our synthetic key.
+                    if (__result == CustomItemLocalizationFallback ||
+                        __result.IndexOf("ITEM_" + CustomItemTypeRaw, StringComparison.Ordinal) >= 0)
                         __result = CustomItemDisplayName;
                 }
                 catch { }
-            }
-        }
-
-        [HarmonyPatch(typeof(ItemSpawnerSettings), "ResetRuntimeData")]
-        private static class Patch_ItemSpawnerSettings_ResetRuntimeData
-        {
-            private static void Postfix(ItemSpawnerSettings __instance)
-            {
-                try
-                {
-                    // Ensure our custom item is registered before injecting into pools so the UI
-                    // can resolve the ItemType when it iterates the pool's SpawnChances.
-                    if (customItemData == null)
-                    {
-                        ItemCollection collection = GameManager.AllItems;
-                        if (collection != null)
-                            EnsureCustomItemRegistered(collection);
-                    }
-                    if (customItemData == null)
-                        return;
-
-                    TryRegisterCustomLocalizationEntry();
-
-                    float mainPercent = Instance.spawnChancePercentConfig.Value;
-                    float leaderPercent = Instance.leaderSpawnChancePercentConfig.Value;
-
-                    if (__instance.AheadOfBallItemPool != null)
-                        EnsurePoolInjected(__instance.AheadOfBallItemPool, mainPercent);
-                    for (int i = 0; i < __instance.ItemPools.Count; i++)
-                    {
-                        ItemSpawnerSettings.ItemPoolData data = __instance.ItemPools[i];
-                        if (data.pool == null)
-                            continue;
-                        // The first entry in ItemPools is the leader pool (minDistanceBehindLeader = 0).
-                        float percent = (i == 0) ? leaderPercent : mainPercent;
-                        EnsurePoolInjected(data.pool, percent);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Log?.LogError($"ResetRuntimeData postfix failed: {ex}");
-                }
             }
         }
 
@@ -1054,15 +1115,124 @@ namespace BallSaboteur
             }
         }
 
-        [HarmonyPatch(typeof(MatchSetupRules), "Update")]
-        private static class Patch_MatchSetupRules_Update
+        // The item isn't in the game's spawn-weight dictionary (our spawn mechanism is a re-roll
+        // postfix on ItemSpawnerSettings.GetRandomItemFor, not pool mutation), so GetWeight would
+        // return 0 and the pause menu would show 0% across every pool. Synthesize a virtual weight
+        // that makes weight/(vanillaTotal + weight) == configured percent, and augment
+        // GetItemPoolTotalWeight by the same amount so vanilla items' displayed ratios still reflect
+        // their true share after the re-roll. PauseMenu is the only reader of these two methods.
+        //
+        // Pool index mapping used by MatchSetupRules.GetItemPool:
+        //   0 = AheadOfBall, 1..4 = ItemPools[n-1] (1 = leader), 5 = Mobility
+        // Our re-roll applies at SpawnChancePercent everywhere except the leader pool, which uses
+        // LeaderSpawnChancePercent.
+        private static float GetVirtualWeightForCustomItem(MatchSetupRules rules, int poolIndex)
         {
-            private static bool Prefix(MatchSetupRules __instance)
-            {
-                if (!CurrentMatchSetupPoolContainsUiUnsupportedItem(__instance))
-                    return true;
+            if (Instance == null || rules == null || matchSetupRulesTotalWeightPerPoolField == null)
+                return 0f;
+            float percent = (poolIndex == 1)
+                ? Instance.leaderSpawnChancePercentConfig.Value
+                : Instance.spawnChancePercentConfig.Value;
+            if (percent <= 0f)
+                return 0f;
+            Dictionary<int, float> totals = matchSetupRulesTotalWeightPerPoolField.GetValue(rules) as Dictionary<int, float>;
+            if (totals == null || !totals.TryGetValue(poolIndex, out float vanillaTotal) || vanillaTotal <= 0f)
+                return 0f;
+            float p = Mathf.Clamp(percent, 0f, 99.99f) / 100f;
+            return p * vanillaTotal / (1f - p);
+        }
 
-                return !RunSafeMatchSetupUpdate(__instance);
+        [HarmonyPatch(typeof(MatchSetupRules), nameof(MatchSetupRules.GetWeight))]
+        private static class Patch_MatchSetupRules_GetWeight
+        {
+            private static void Postfix(MatchSetupRules __instance, int poolIndex, ItemType itemType, ref float __result)
+            {
+                if (itemType != CustomItemType || customItemData == null)
+                    return;
+                __result = GetVirtualWeightForCustomItem(__instance, poolIndex);
+            }
+        }
+
+        [HarmonyPatch(typeof(MatchSetupRules), nameof(MatchSetupRules.GetItemPoolTotalWeight))]
+        private static class Patch_MatchSetupRules_GetItemPoolTotalWeight
+        {
+            private static void Postfix(MatchSetupRules __instance, int index, ref float __result)
+            {
+                if (customItemData == null)
+                    return;
+                __result += GetVirtualWeightForCustomItem(__instance, index);
+            }
+        }
+
+        private static float GetSpawnChancePercentForPlayer(ItemSpawnerSettings settings, PlayerInfo player)
+        {
+            if (Instance == null || settings == null || player == null || player.AsGolfer == null)
+                return 0f;
+
+            if (settings.AheadOfBallItemPool != null && player.AsGolfer.IsAheadOfBall)
+                return Instance.spawnChancePercentConfig.Value;
+
+            List<ItemSpawnerSettings.ItemPoolData> pools = settings.ItemPools;
+            if (pools == null || pools.Count == 0)
+                return 0f;
+
+            if (SingletonBehaviour<DrivingRangeManager>.HasInstance || pools.Count == 1)
+                return Instance.spawnChancePercentConfig.Value;
+
+            if (GolfHoleManager.MainHole == null)
+                return Instance.spawnChancePercentConfig.Value;
+
+            float leaderDistance = 0f;
+            if (CourseManager.MatchState <= MatchState.Ongoing)
+            {
+                Vector3 holePos = GolfHoleManager.MainHole.transform.position;
+                float bestSqr = float.MaxValue;
+                foreach (PlayerGolfer participant in CourseManager.ServerMatchParticipants)
+                {
+                    if (participant == null || participant.IsMatchResolved)
+                        continue;
+                    PlayerInfo pi = participant.PlayerInfo;
+                    if (pi == null || pi.AsSpectator == null || pi.AsSpectator.IsSpectating)
+                        continue;
+
+                    float sqr = (holePos - participant.transform.position).sqrMagnitude;
+                    if (sqr < bestSqr)
+                        bestSqr = sqr;
+                }
+                if (bestSqr < float.MaxValue)
+                    leaderDistance = Mathf.Sqrt(bestSqr);
+            }
+
+            float distanceBehindLeader = (GolfHoleManager.MainHole.transform.position - player.transform.position).magnitude - leaderDistance;
+            int poolIndex = pools.Count - 1;
+            for (int i = 0; i < pools.Count - 1; i++)
+            {
+                if (distanceBehindLeader <= pools[i + 1].minDistanceBehindLeader)
+                {
+                    poolIndex = i;
+                    break;
+                }
+            }
+
+            return poolIndex == 0
+                ? Instance.leaderSpawnChancePercentConfig.Value
+                : Instance.spawnChancePercentConfig.Value;
+        }
+
+        [HarmonyPatch(typeof(ItemSpawnerSettings), nameof(ItemSpawnerSettings.GetRandomItemFor))]
+        private static class Patch_ItemSpawnerSettings_GetRandomItemFor
+        {
+            private static void Postfix(ItemSpawnerSettings __instance, PlayerInfo player, ref ItemType __result)
+            {
+                if (customItemData == null)
+                    return;
+
+                float percent = GetSpawnChancePercentForPlayer(__instance, player);
+                if (percent <= 0f)
+                    return;
+
+                if (UnityEngine.Random.value <= percent / 100f)
+                    __result = CustomItemType;
             }
         }
 
