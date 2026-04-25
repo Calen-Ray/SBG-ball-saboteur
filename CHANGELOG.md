@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.0
+
+- Fix the inventory hotkey label showing "Global Strike" while Ball Saboteur is equipped. The
+  hotkey UI looked up the localized name through `GetEffectivelyEquippedItem`, which our remap
+  redirected to Orbital Laser. A targeted `HotkeyUi.SetName` prefix now substitutes our
+  `LocalizedName` whenever the local player's actual equipped slot is the saboteur item.
+- Fix the lock-on reticle flickering while the saboteur is equipped. The vanilla `OnBUpdate`
+  switch keys on the unmapped slot type and was nulling the lock-on target every frame; our
+  postfix immediately re-set it, producing a per-frame null→target transition. Replaced with a
+  `Prefix` that skips the vanilla switch and runs the OL targeting path once per frame.
+- Fix the saboteur item not disappearing from the inventory after activation. The use flow now
+  calls `DecrementUseFromSlotAt` (mirroring the local override and updating the hotkey icon)
+  followed by `RemoveIfOutOfUses`, matching the vanilla Orbital Laser activation routine.
+- Tint the dropped pickup model so it's visually distinct from the vanilla Orbital Laser.
+  Configurable via `Visuals.TintPickupModel` and `Visuals.TintPickupColorHex` (default magenta).
+
 ## 0.1.3
 
 - Fix a main-thread freeze when loading into the Driving Range (and any host-local lobby). v0.1.2

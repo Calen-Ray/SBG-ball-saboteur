@@ -19,7 +19,7 @@ namespace BallSaboteur
     {
         public const string ModGuid = "sbg.ballsaboteur";
         public const string ModName = "BallSaboteur";
-        public const string ModVersion = "0.1.2";
+        public const string ModVersion = "0.2.0";
 
         internal const int CustomItemTypeRaw = 1001;
         internal const string CustomItemDisplayName = "Ball Saboteur";
@@ -59,7 +59,8 @@ namespace BallSaboteur
         private static MethodInfo inventoryCancelItemFlourishMethod;
         private static MethodInfo inventorySetItemUseTimestampMethod;
         private static MethodInfo inventoryIncrementAndGetCurrentItemUseIdMethod;
-        private static MethodInfo inventoryCmdDecrementUseFromSlotAtMethod;
+        private static MethodInfo inventoryDecrementUseFromSlotAtMethod;
+        private static MethodInfo inventoryRemoveIfOutOfUsesMethod;
         private static MethodInfo inventoryCmdActivateOrbitalLaserMethod;
         private static MethodInfo inventorySetLockOnTargetMethod;
         private static MethodInfo inventoryOnActivatedOrbitalLaserMethod;
@@ -89,6 +90,8 @@ namespace BallSaboteur
         private ConfigEntry<float> hopImpulseConfig;
         private ConfigEntry<float> fallRescueThresholdConfig;
         private ConfigEntry<float> cubeMassMultiplierConfig;
+        private ConfigEntry<bool> tintPickupEnabledConfig;
+        private ConfigEntry<string> tintPickupColorHexConfig;
         private ConfigEntry<bool> debugGrantHotkeyEnabledConfig;
         private ConfigEntry<bool> debugSelfSabotageHotkeyEnabledConfig;
         private bool debugGrantPressedLastFrame;
@@ -129,6 +132,16 @@ namespace BallSaboteur
                 "CubeMassMultiplier",
                 3.0f,
                 "Rigidbody mass is multiplied by this factor while the ball is a cube. Higher values make the cube roll less and thud harder on landing. Restored to the original mass when the sabotage ends. 1.0 disables.");
+            tintPickupEnabledConfig = Config.Bind(
+                "Visuals",
+                "TintPickupModel",
+                true,
+                "Tint the dropped Ball Saboteur pickup model so it's visually distinct from the vanilla Orbital Laser. Disable to render in the Orbital Laser's original colors.");
+            tintPickupColorHexConfig = Config.Bind(
+                "Visuals",
+                "TintPickupColorHex",
+                "#B53AFF",
+                "Hex color (e.g. #B53AFF) applied to the pickup model when tinting is enabled. Multiplies the original material color, so dark base materials may darken further.");
             debugGrantHotkeyEnabledConfig = Config.Bind(
                 "Debug",
                 "EnableGrantHotkey",
@@ -178,7 +191,8 @@ namespace BallSaboteur
             inventoryCancelItemFlourishMethod = AccessTools.Method(typeof(PlayerInventory), "CancelItemFlourish");
             inventorySetItemUseTimestampMethod = AccessTools.Method(typeof(PlayerInventory), "set_ItemUseTimestamp");
             inventoryIncrementAndGetCurrentItemUseIdMethod = AccessTools.Method(typeof(PlayerInventory), "IncrementAndGetCurrentItemUseId");
-            inventoryCmdDecrementUseFromSlotAtMethod = AccessTools.Method(typeof(PlayerInventory), "CmdDecrementUseFromSlotAt");
+            inventoryDecrementUseFromSlotAtMethod = AccessTools.Method(typeof(PlayerInventory), "DecrementUseFromSlotAt");
+            inventoryRemoveIfOutOfUsesMethod = AccessTools.Method(typeof(PlayerInventory), "RemoveIfOutOfUses");
             inventoryCmdActivateOrbitalLaserMethod = AccessTools.Method(typeof(PlayerInventory), "CmdActivateOrbitalLaser");
             inventorySetLockOnTargetMethod = AccessTools.Method(typeof(PlayerInventory), "SetLockOnTarget");
             inventoryOnActivatedOrbitalLaserMethod = AccessTools.Method(typeof(PlayerInventory), "OnActivatedOrbitalLaser");
@@ -415,6 +429,8 @@ namespace BallSaboteur
             if (physicalItem != null && physicalItemTypeField != null)
                 physicalItemTypeField.SetValue(physicalItem, CustomItemType);
 
+            ApplyPickupTint(customPickupPrefab);
+
             // Our clone carries Orbital Laser's NetworkIdentity.assetId. That conflicts with the
             // real OL prefab, and on drop NetworkServer.Spawn broadcasts a SpawnMessage that
             // remote clients resolve against the game's prefab registry — they either find OL
@@ -428,6 +444,45 @@ namespace BallSaboteur
                 customPickupAssetId = ComputeCustomPickupAssetId();
                 networkIdentityAssetIdField.SetValue(identity, 0u);
                 TryRegisterCustomPickupPrefab();
+            }
+        }
+
+        private static void ApplyPickupTint(GameObject prefab)
+        {
+            if (prefab == null || Instance == null || !Instance.tintPickupEnabledConfig.Value)
+                return;
+            if (!ColorUtility.TryParseHtmlString(Instance.tintPickupColorHexConfig.Value, out Color tint))
+            {
+                Log?.LogWarning($"Invalid TintPickupColorHex '{Instance.tintPickupColorHexConfig.Value}'; skipping pickup tint.");
+                return;
+            }
+
+            // Replicate the tint per renderer so the inactive-template prefab carries it; new
+            // material instances on each Renderer keep the source OL prefab untouched.
+            Renderer[] renderers = prefab.GetComponentsInChildren<Renderer>(true);
+            foreach (Renderer renderer in renderers)
+            {
+                if (renderer == null)
+                    continue;
+
+                Material[] sources = renderer.sharedMaterials;
+                if (sources == null || sources.Length == 0)
+                    continue;
+
+                Material[] copies = new Material[sources.Length];
+                for (int i = 0; i < sources.Length; i++)
+                {
+                    Material source = sources[i];
+                    if (source == null)
+                        continue;
+
+                    Material copy = new Material(source);
+                    if (copy.HasProperty("_Color")) copy.color = copy.color * tint;
+                    if (copy.HasProperty("_BaseColor")) copy.SetColor("_BaseColor", copy.GetColor("_BaseColor") * tint);
+                    if (copy.HasProperty("_EmissionColor")) copy.SetColor("_EmissionColor", copy.GetColor("_EmissionColor") * tint);
+                    copies[i] = copy;
+                }
+                renderer.sharedMaterials = copies;
             }
         }
 
@@ -527,8 +582,13 @@ namespace BallSaboteur
             user.CancelEmote(false);
 
             ItemUseId itemUseId = InvokeInventoryIncrementAndGetCurrentItemUseId(inventory, CustomItemType);
-            inventoryCmdDecrementUseFromSlotAtMethod?.Invoke(inventory, new object[] { inventory.EquippedItemIndex });
+            // Mirror the vanilla OL flow: server activate, then decrement (which mirrors locally
+            // and updates the hotkey UI), then RemoveIfOutOfUses so a single-use item disappears
+            // from the inventory immediately. Previously we only fired the Cmd-decrement, which
+            // updated the server-side slot but left the local override and slot count untouched —
+            // the icon stayed in the bar after activation.
             inventoryCmdActivateOrbitalLaserMethod?.Invoke(inventory, new object[] { targetHittable, targetBall.transform.position, itemUseId });
+            inventoryDecrementUseFromSlotAtMethod?.Invoke(inventory, new object[] { inventory.EquippedItemIndex });
             inventorySetLockOnTargetMethod?.Invoke(inventory, new object[] { null });
 
             try
@@ -539,6 +599,8 @@ namespace BallSaboteur
             {
                 Log?.LogDebug($"Local Orbital Laser activation reuse failed: {ex.Message}");
             }
+
+            inventoryRemoveIfOutOfUsesMethod?.Invoke(inventory, new object[] { inventory.EquippedItemIndex });
 
             shouldEatInput = false;
             return true;
@@ -922,12 +984,22 @@ namespace BallSaboteur
             }
         }
 
+        // OnBUpdate's vanilla switch keys on the *unmapped* effective slot type, so our custom
+        // type falls through the default arm to SetLockOnTarget(null). A postfix that re-set the
+        // OL lock-on target after vanilla nulled it produced one null→target transition per
+        // frame, which the LockOnTargetUiManager rendered as a faint reticle flicker. Prefix-
+        // skip vanilla entirely when our item is equipped and run the OL targeting path once.
         [HarmonyPatch(typeof(PlayerInventory), nameof(PlayerInventory.OnBUpdate))]
         private static class Patch_PlayerInventory_OnBUpdate
         {
-            private static void Postfix(PlayerInventory __instance)
+            private static bool Prefix(PlayerInventory __instance)
             {
+                InventorySlot slot = InvokeInventoryGetEffectiveSlot(__instance, __instance.EquippedItemIndex);
+                if (slot.itemType != CustomItemType)
+                    return true;
+
                 UpdateCustomLockOnTargeting(__instance);
+                return false;
             }
         }
 
@@ -953,6 +1025,31 @@ namespace BallSaboteur
         private static class Patch_NetworkClient_RegisterMessageHandlers
         {
             private static void Postfix() => RegisterNetworkHandlers();
+        }
+
+        // The hotkey-bar selected-item label looks up the localized name via
+        // GameManager.AllItems.TryGetItemData(GetEffectivelyEquippedItem()). Our broad remap of
+        // GetEffectivelyEquippedItem to OrbitalLaser made it return OL's ItemData → "Global
+        // Strike". Detect when the local player's actual equipped slot is our item and swap in
+        // our LocalizedName before HotkeyUi resolves it. EquippedItemIndex < 0 yields a default
+        // slot (itemType=None) so the deselect/golf-club path skips this safely.
+        [HarmonyPatch(typeof(HotkeyUi), nameof(HotkeyUi.SetName))]
+        private static class Patch_HotkeyUi_SetName
+        {
+            private static void Prefix(ref LocalizedString localizedName)
+            {
+                if (customItemData == null)
+                    return;
+                PlayerInventory inv = GameManager.LocalPlayerInventory;
+                if (inv == null)
+                    return;
+
+                InventorySlot slot = InvokeInventoryGetEffectiveSlot(inv, inv.EquippedItemIndex);
+                if (slot.itemType != CustomItemType)
+                    return;
+
+                localizedName = customItemData.LocalizedName;
+            }
         }
 
         [HarmonyPatch(typeof(LocalizedString), nameof(LocalizedString.GetLocalizedString), new Type[0])]
