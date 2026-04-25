@@ -30,3 +30,8 @@ Thumbs.db
 # icon.png is the official Thunderstore package icon and must be tracked.
 *.png
 !icon.png
+
+# Internal notes for Claude / coding agents — not part of the repo
+CLAUDE.md
+TODO.md
+AGENTS.md
