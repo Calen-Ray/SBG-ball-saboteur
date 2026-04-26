@@ -19,7 +19,7 @@ namespace BallSaboteur
     {
         public const string ModGuid = "sbg.ballsaboteur";
         public const string ModName = "BallSaboteur";
-        public const string ModVersion = "0.2.0";
+        public const string ModVersion = "0.2.1";
 
         internal const int CustomItemTypeRaw = 1001;
         internal const string CustomItemDisplayName = "Ball Saboteur";
@@ -849,14 +849,39 @@ namespace BallSaboteur
         [HarmonyPatch(typeof(ItemCollection), nameof(ItemCollection.GetItemAtIndex))]
         private static class Patch_ItemCollection_GetItemAtIndex
         {
+            // Multi-mod-aware lookup: when several mods each += 1 to ItemCollection.Count, the
+            // synthetic indices `items.Length`, `items.Length + 1`, ... must each map to a
+            // distinct custom ItemData. The previous "index == items.Length" check only handled
+            // the FIRST custom slot, so PauseMenu.Awake threw IndexOutOfRangeException when a
+            // second mod (e.g. GolfCartLauncher) added another. Resolve the synthetic index by
+            // sorting all >=1000 (custom-range) ItemTypes in the shared allItemData dict; the
+            // (index - items.Length)-th key is the canonical mod for that slot.
             private static bool Prefix(ItemCollection __instance, int index, ref ItemData __result)
             {
-                if (customItemData == null || itemCollectionItemsField == null)
+                if (customItemData == null || itemCollectionItemsField == null || itemCollectionMapField == null)
                     return true;
 
                 ItemData[] items = itemCollectionItemsField.GetValue(__instance) as ItemData[];
-                if (items == null || index != items.Length)
+                if (items == null || index < items.Length)
                     return true;
+
+                Dictionary<ItemType, ItemData> map = itemCollectionMapField.GetValue(__instance) as Dictionary<ItemType, ItemData>;
+                if (map == null)
+                    return true;
+
+                List<ItemType> customKeys = new List<ItemType>();
+                foreach (KeyValuePair<ItemType, ItemData> kv in map)
+                {
+                    if ((int)kv.Key >= 1000)
+                        customKeys.Add(kv.Key);
+                }
+                customKeys.Sort((a, b) => ((int)a).CompareTo((int)b));
+
+                int customIdx = index - items.Length;
+                if (customIdx < 0 || customIdx >= customKeys.Count)
+                    return true;
+                if (customKeys[customIdx] != CustomItemType)
+                    return true; // not our slot — let the next mod's prefix handle
 
                 __result = customItemData;
                 return false;

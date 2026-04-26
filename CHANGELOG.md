@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1
+
+- Fix the pause menu failing to initialise (and Esc not opening it) when **another** mod also
+  injects a custom `ItemType` via the same ItemCollection extension trick. Both mods'
+  `Count` postfixes correctly added 1, but each mod's `GetItemAtIndex` prefix only handled
+  `index == items.Length` — so the second synthetic slot fell through to vanilla and threw
+  `IndexOutOfRangeException` from `PauseMenu.Awake`. The lookup is now multi-mod-aware: it
+  resolves the synthetic index against the sorted list of all >= 1000 custom ItemTypes in
+  `allItemData`, so each mod's prefix only claims the slot that maps to its own type.
+
 ## 0.2.0
 
 - Fix the inventory hotkey label showing "Global Strike" while Ball Saboteur is equipped. The
